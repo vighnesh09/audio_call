@@ -25,19 +25,54 @@
             margin-top: 20px;
             font-size: 18px;
         }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 20px 0;
+        }
+        .meter {
+            height: 20px;
+            position: relative;
+            background: #ddd;
+            border-radius: 25px;
+            width: 300px;
+            margin: 10px 0;
+        }
+        .meter > span {
+            display: block;
+            height: 100%;
+            border-radius: 25px;
+            background-color: #4CAF50;
+            position: relative;
+            overflow: hidden;
+            transition: width 0.1s ease;
+        }
     </style>
 </head>
 <body>
     <h1>Real-Time Audio Call</h1>
-    <button id="startBtn">Start</button>
-    <button id="stopBtn" disabled>Stop</button>
-    <div id="status">Press Start to begin</div>
+    <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <div id="status">Press Start to begin</div>
+        <div class="meter">
+            <span id="volumeMeter" style="width: 0%"></span>
+        </div>
+    </div>
 
     <script>
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const status = document.getElementById('status');
+        const volumeMeter = document.getElementById('volumeMeter');
+        
         let audioContext, stream, processor, ws;
+        let audioQueue = [];
+        const SAMPLE_RATE = 24000; // Optimized sample rate for voice
+        const BUFFER_SIZE = 1024; // Smaller buffer for lower latency
+        let playbackBuffer = null;
+        let isPlaying = false;
 
         // Dynamically construct WebSocket URL
         function getWebSocketUrl() {
@@ -60,13 +95,20 @@
             ws.onmessage = (event) => {
                 const arrayBuffer = event.data;
                 const audioData = new Float32Array(arrayBuffer);
-                playAudio(audioData);
+                
+                // Add received data to queue
+                audioQueue.push(audioData);
+                
+                // Start playback if not already playing
+                if (!isPlaying) {
+                    playNextAudioChunk();
+                }
             };
 
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
                 status.textContent = 'Disconnected, attempting to reconnect...';
-                setTimeout(initWebSocket, 2000); // Reconnect after 2 seconds
+                setTimeout(initWebSocket, 1000); // Quicker reconnect
             };
 
             ws.onerror = (error) => {
@@ -75,43 +117,124 @@
             };
         }
 
-        // Play audio data
-        function playAudio(audioData) {
+        // Play next audio chunk from queue
+        function playNextAudioChunk() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const audioData = audioQueue.shift();
+            
+            // Create buffer and play audio
             const buffer = audioContext.createBuffer(1, audioData.length, audioContext.sampleRate);
             buffer.copyToChannel(audioData, 0);
+            
             const source = audioContext.createBufferSource();
             source.buffer = buffer;
             source.connect(audioContext.destination);
-            source.start();
+            
+            // When this chunk ends, play the next one
+            source.onended = playNextAudioChunk;
+            
+            // Schedule playback with minimal delay
+            const playDelay = 0.01; // 10ms scheduling delay
+            source.start(audioContext.currentTime + playDelay);
+        }
+
+        // Update volume meter
+        function updateVolumeMeter(audioData) {
+            if (!audioData) return;
+            
+            // Calculate RMS volume
+            let sum = 0;
+            for (let i = 0; i < audioData.length; i++) {
+                sum += audioData[i] * audioData[i];
+            }
+            const rms = Math.sqrt(sum / audioData.length);
+            
+            // Map RMS to percentage (0-100)
+            const volumePercent = Math.min(100, rms * 400);
+            volumeMeter.style.width = volumePercent + '%';
         }
 
         // Start capturing audio
         async function startCapture() {
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ 
+                    sampleRate: SAMPLE_RATE,
+                    latencyHint: 'interactive' // Optimize for interactive applications
+                });
+                
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        channelCount: 1, // Mono for voice
+                        sampleRate: SAMPLE_RATE
+                    } 
+                });
+                
                 const source = audioContext.createMediaStreamSource(stream);
-
-                // Create processor to capture audio
+                
+                // Create audio processor worklet
                 await audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([`
                     class AudioProcessor extends AudioWorkletProcessor {
                         constructor() {
                             super();
                             this.buffer = [];
-                            this.bufferSize = 2048; // Reduced for lower latency
+                            this.bufferSize = ${BUFFER_SIZE};
+                            this.sampleRate = ${SAMPLE_RATE};
                         }
 
-                        process(inputs) {
+                        process(inputs, outputs) {
                             const input = inputs[0][0];
                             if (input) {
+                                // Analyze audio for volume meter
+                                let sum = 0;
+                                for (let i = 0; i < input.length; i++) {
+                                    sum += input[i] * input[i];
+                                }
+                                const rms = Math.sqrt(sum / input.length);
+                                
+                                // Add data to buffer
                                 this.buffer.push(...input);
+                                
+                                // Send chunks when buffer reaches size
                                 while (this.buffer.length >= this.bufferSize) {
                                     const chunk = this.buffer.slice(0, this.bufferSize);
-                                    this.port.postMessage(new Float32Array(chunk));
+                                    
+                                    // Apply simple compression to reduce dynamic range
+                                    const compressedChunk = this.compressAudio(chunk);
+                                    
+                                    this.port.postMessage({
+                                        audioData: new Float32Array(compressedChunk),
+                                        volume: rms
+                                    });
+                                    
                                     this.buffer = this.buffer.slice(this.bufferSize);
                                 }
                             }
                             return true;
+                        }
+                        
+                        compressAudio(audioData) {
+                            // Simple compression algorithm
+                            const threshold = 0.3;
+                            const ratio = 4; // 4:1 compression
+                            const makeup = 1.5; // Gain makeup
+                            
+                            return audioData.map(sample => {
+                                const absValue = Math.abs(sample);
+                                if (absValue <= threshold) {
+                                    return sample * makeup;
+                                } else {
+                                    const gain = threshold + (absValue - threshold) / ratio;
+                                    return (sample > 0 ? gain : -gain) * makeup;
+                                }
+                            });
                         }
                     }
                     registerProcessor('audio-processor', AudioProcessor);
@@ -120,13 +243,13 @@
                 processor = new AudioWorkletNode(audioContext, 'audio-processor');
                 processor.port.onmessage = (event) => {
                     if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(event.data.buffer);
+                        ws.send(event.data.audioData.buffer);
+                        updateVolumeMeter(event.data.audioData);
                     }
                 };
 
                 source.connect(processor);
-                processor.connect(audioContext.destination);
-
+                
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
                 status.textContent = 'Capturing and broadcasting audio...';
@@ -147,9 +270,15 @@
             if (audioContext) {
                 audioContext.close();
             }
+            
+            // Clear audio queue
+            audioQueue = [];
+            isPlaying = false;
+            
             startBtn.disabled = false;
             stopBtn.disabled = true;
             status.textContent = 'Stopped';
+            volumeMeter.style.width = '0%';
         }
 
         // Event listeners

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Audio Call</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 10px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #status {
+            margin-top: 20px;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Real-Time Audio Call</h1>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <div id="status">Press Start to begin</div>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+        let audioContext, stream, processor, ws;
+
+        // Dynamically construct WebSocket URL
+        function getWebSocketUrl() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.host;
+            return `${protocol}//${host}/ws`;
+        }
+
+        // Initialize WebSocket with reconnection
+        function initWebSocket() {
+            const wsUrl = getWebSocketUrl();
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                console.log('WebSocket connected to', wsUrl);
+                status.textContent = 'Connected to server';
+            };
+
+            ws.onmessage = (event) => {
+                const arrayBuffer = event.data;
+                const audioData = new Float32Array(arrayBuffer);
+                playAudio(audioData);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                status.textContent = 'Disconnected, attempting to reconnect...';
+                setTimeout(initWebSocket, 2000); // Reconnect after 2 seconds
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                status.textContent = 'WebSocket error, reconnecting...';
+            };
+        }
+
+        // Play audio data
+        function playAudio(audioData) {
+            const buffer = audioContext.createBuffer(1, audioData.length, audioContext.sampleRate);
+            buffer.copyToChannel(audioData, 0);
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start();
+        }
+
+        // Start capturing audio
+        async function startCapture() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioContext.createMediaStreamSource(stream);
+
+                // Create processor to capture audio
+                await audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+                    class AudioProcessor extends AudioWorkletProcessor {
+                        constructor() {
+                            super();
+                            this.buffer = [];
+                            this.bufferSize = 2048; // Reduced for lower latency
+                        }
+
+                        process(inputs) {
+                            const input = inputs[0][0];
+                            if (input) {
+                                this.buffer.push(...input);
+                                while (this.buffer.length >= this.bufferSize) {
+                                    const chunk = this.buffer.slice(0, this.bufferSize);
+                                    this.port.postMessage(new Float32Array(chunk));
+                                    this.buffer = this.buffer.slice(this.bufferSize);
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                    registerProcessor('audio-processor', AudioProcessor);
+                `], { type: 'application/javascript' })));
+
+                processor = new AudioWorkletNode(audioContext, 'audio-processor');
+                processor.port.onmessage = (event) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(event.data.buffer);
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                status.textContent = 'Capturing and broadcasting audio...';
+            } catch (error) {
+                console.error('Error starting capture:', error);
+                status.textContent = 'Error: Could not access microphone. Please allow microphone access.';
+            }
+        }
+
+        // Stop capturing audio
+        function stopCapture() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            if (processor) {
+                processor.disconnect();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            status.textContent = 'Stopped';
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                initWebSocket();
+            }
+            startCapture();
+        });
+
+        stopBtn.addEventListener('click', stopCapture);
+
+        // Cleanup on page unload
+        window.addEventListener('unload', stopCapture);
+    </script>
+</body>
+</html>

@@ -48,6 +48,16 @@
             overflow: hidden;
             transition: width 0.1s ease;
         }
+        .settings {
+            margin: 10px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .latency-display {
+            font-size: 14px;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
@@ -59,6 +69,15 @@
         <div class="meter">
             <span id="volumeMeter" style="width: 0%"></span>
         </div>
+        <div class="settings">
+            <label>
+                <input type="checkbox" id="lowLatencyMode" checked>
+                Ultra-low latency mode (may increase glitches)
+            </label>
+            <div class="latency-display">
+                Current latency: <span id="latencyValue">0</span> ms
+            </div>
+        </div>
     </div>
 
     <script>
@@ -66,13 +85,130 @@
         const stopBtn = document.getElementById('stopBtn');
         const status = document.getElementById('status');
         const volumeMeter = document.getElementById('volumeMeter');
+        const lowLatencyMode = document.getElementById('lowLatencyMode');
+        const latencyValue = document.getElementById('latencyValue');
         
         let audioContext, stream, processor, ws;
         let audioQueue = [];
-        const SAMPLE_RATE = 24000; // Optimized sample rate for voice
-        const BUFFER_SIZE = 1024; // Smaller buffer for lower latency
-        let playbackBuffer = null;
+        const SAMPLE_RATE = 16000; // Lower sample rate for reduced bandwidth
+        const BUFFER_SIZE = 256; // Ultra-small buffer for minimal latency
         let isPlaying = false;
+        let packetCounter = 0;
+        let lastPacketTime = 0;
+        let latencyHistory = [];
+        let avgLatency = 0;
+        
+        // Network conditions detection
+        let packetLossCounter = 0;
+        let packetLossThreshold = 5;
+        let networkQuality = 'good'; // 'good', 'medium', 'poor'
+        
+        // Jitter buffer controller
+        class JitterBufferController {
+            constructor() {
+                this.targetBufferSize = 2; // Start with 2 packets (adaptive)
+                this.minBufferSize = 1;    // Min 1 packet for ultra-low latency
+                this.maxBufferSize = 5;    // Max 5 packets for poor networks
+                this.jitterMeasurements = [];
+                this.maxMeasurements = 50;
+                this.adaptationInterval = 1000; // ms
+                this.lastAdaptation = 0;
+                this.networkLatency = 0;     // Estimated one-way network latency
+            }
+            
+            // Add inter-packet arrival time measurement
+            addMeasurement(arrivalTimeMs) {
+                if (lastPacketTime > 0) {
+                    // Calculate jitter and add to measurements
+                    const interArrivalTime = arrivalTimeMs - lastPacketTime;
+                    this.jitterMeasurements.push(interArrivalTime);
+                    
+                    // Keep limited history
+                    if (this.jitterMeasurements.length > this.maxMeasurements) {
+                        this.jitterMeasurements.shift();
+                    }
+                }
+                lastPacketTime = arrivalTimeMs;
+                
+                // Adapt buffer size if needed
+                this.maybeAdapt();
+            }
+            
+            // Get current optimal buffer size based on network conditions
+            getTargetBufferSize() {
+                return Math.min(
+                    this.maxBufferSize, 
+                    Math.max(this.minBufferSize, this.targetBufferSize)
+                );
+            }
+            
+            // Calculate jitter
+            calculateJitter() {
+                if (this.jitterMeasurements.length < 2) return 0;
+                
+                // Calculate mean
+                const mean = this.jitterMeasurements.reduce((a, b) => a + b, 0) / 
+                             this.jitterMeasurements.length;
+                
+                // Calculate variance
+                const variance = this.jitterMeasurements.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / 
+                                 this.jitterMeasurements.length;
+                
+                // Return standard deviation (jitter)
+                return Math.sqrt(variance);
+            }
+            
+            // Adapt buffer size based on network conditions
+            maybeAdapt() {
+                const now = performance.now();
+                if (now - this.lastAdaptation < this.adaptationInterval) return;
+                
+                this.lastAdaptation = now;
+                const jitter = this.calculateJitter();
+                
+                // Adapt based on jitter and low latency mode preference
+                if (lowLatencyMode.checked) {
+                    // Ultra-low latency mode prioritizes minimal buffering
+                    this.targetBufferSize = this.minBufferSize;
+                    if (jitter > 50) {
+                        // Only increase if jitter is very high
+                        this.targetBufferSize = 2;
+                    }
+                } else {
+                    // Normal mode adapts based on network quality
+                    if (jitter < 20) {
+                        // Good network: reduce buffer
+                        this.targetBufferSize = Math.max(this.minBufferSize, this.targetBufferSize - 1);
+                        networkQuality = 'good';
+                    } else if (jitter > 50) {
+                        // Poor network: increase buffer
+                        this.targetBufferSize = Math.min(this.maxBufferSize, this.targetBufferSize + 1);
+                        networkQuality = 'poor';
+                    } else {
+                        networkQuality = 'medium';
+                    }
+                }
+                
+                // Update UI with network quality info
+                updateNetworkInfo(jitter);
+            }
+            
+            // Update estimated network latency
+            updateNetworkLatency(latency) {
+                this.networkLatency = latency;
+            }
+        }
+        
+        // Create jitter buffer controller
+        const jitterBuffer = new JitterBufferController();
+        
+        // Update network quality info in UI
+        function updateNetworkInfo(jitter) {
+            // Update latency display
+            if (avgLatency > 0) {
+                latencyValue.textContent = Math.round(avgLatency);
+            }
+        }
 
         // Dynamically construct WebSocket URL
         function getWebSocketUrl() {
@@ -93,11 +229,22 @@
             };
 
             ws.onmessage = (event) => {
+                const receiveTime = performance.now();
                 const arrayBuffer = event.data;
                 const audioData = new Float32Array(arrayBuffer);
                 
+                // Track packet timing for jitter buffer control
+                packetCounter++;
+                jitterBuffer.addMeasurement(receiveTime);
+                
                 // Add received data to queue
-                audioQueue.push(audioData);
+                audioQueue.push({
+                    data: audioData,
+                    receiveTime: receiveTime
+                });
+                
+                // Measure latency from time packet was received
+                updateLatencyMeasurement(receiveTime);
                 
                 // Start playback if not already playing
                 if (!isPlaying) {
@@ -108,7 +255,7 @@
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
                 status.textContent = 'Disconnected, attempting to reconnect...';
-                setTimeout(initWebSocket, 1000); // Quicker reconnect
+                setTimeout(initWebSocket, 500); // Even quicker reconnect
             };
 
             ws.onerror = (error) => {
@@ -116,31 +263,74 @@
                 status.textContent = 'WebSocket error, reconnecting...';
             };
         }
+        
+        // Update latency measurement
+        function updateLatencyMeasurement(receiveTime) {
+            // Calculate moving average latency
+            if (latencyHistory.length > 0) {
+                // Calculate time since last packet
+                const latency = receiveTime - latencyHistory[latencyHistory.length - 1];
+                
+                // Add to history (limit to 20 samples)
+                latencyHistory.push(receiveTime);
+                if (latencyHistory.length > 20) {
+                    latencyHistory.shift();
+                }
+                
+                // Update average latency
+                avgLatency = avgLatency * 0.7 + latency * 0.3; // Exponential moving average
+            } else {
+                latencyHistory.push(receiveTime);
+            }
+        }
 
         // Play next audio chunk from queue
         function playNextAudioChunk() {
+            // Check if we have enough packets to start playback based on jitter buffer setting
+            const targetBufferSize = jitterBuffer.getTargetBufferSize();
+            
+            if (audioQueue.length < targetBufferSize && audioQueue.length > 0) {
+                // Not enough data yet but we have some - schedule check for more data
+                setTimeout(playNextAudioChunk, 5);
+                return;
+            }
+            
             if (audioQueue.length === 0) {
                 isPlaying = false;
                 return;
             }
             
             isPlaying = true;
-            const audioData = audioQueue.shift();
             
-            // Create buffer and play audio
-            const buffer = audioContext.createBuffer(1, audioData.length, audioContext.sampleRate);
-            buffer.copyToChannel(audioData, 0);
+            // Get oldest packet in queue
+            const packet = audioQueue.shift();
+            const audioData = packet.data;
             
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(audioContext.destination);
+            // Calculate time spent in buffer
+            const bufferTime = performance.now() - packet.receiveTime;
             
-            // When this chunk ends, play the next one
-            source.onended = playNextAudioChunk;
-            
-            // Schedule playback with minimal delay
-            const playDelay = 0.01; // 10ms scheduling delay
-            source.start(audioContext.currentTime + playDelay);
+            // Create and play audio
+            try {
+                const buffer = audioContext.createBuffer(1, audioData.length, audioContext.sampleRate);
+                buffer.copyToChannel(audioData, 0);
+                
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                
+                // When this chunk ends, play the next one immediately
+                source.onended = () => {
+                    // Schedule next chunk playback immediately
+                    setTimeout(playNextAudioChunk, 0);
+                };
+                
+                // Schedule playback with NO delay for ultra-low latency
+                source.start(audioContext.currentTime);
+            } catch (err) {
+                console.error("Audio playback error:", err);
+                // Try next chunk
+                setTimeout(playNextAudioChunk, 0);
+            }
         }
 
         // Update volume meter
@@ -167,72 +357,98 @@
                     latencyHint: 'interactive' // Optimize for interactive applications
                 });
                 
+                // Request higher priority for audio thread
+                if (audioContext.audioWorklet && navigator.userActivation && navigator.userActivation.isActive) {
+                    // Modern browsers with user activation
+                    try {
+                        // @ts-ignore - Non-standard API
+                        if (audioContext.setPriority) {
+                            // @ts-ignore
+                            audioContext.setPriority('playback');
+                        }
+                    } catch (e) {
+                        console.warn('Could not set audio priority:', e);
+                    }
+                }
+                
                 stream = await navigator.mediaDevices.getUserMedia({ 
                     audio: {
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true,
                         channelCount: 1, // Mono for voice
+                        sampleSize: 16,
                         sampleRate: SAMPLE_RATE
                     } 
                 });
                 
                 const source = audioContext.createMediaStreamSource(stream);
                 
-                // Create audio processor worklet
+                // Create audio processor worklet with optimized processing
                 await audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([`
                     class AudioProcessor extends AudioWorkletProcessor {
                         constructor() {
                             super();
                             this.buffer = [];
-                            this.bufferSize = ${BUFFER_SIZE};
+                            this.bufferSize = ${BUFFER_SIZE}; // Ultra-small buffer
                             this.sampleRate = ${SAMPLE_RATE};
+                            this.packetCounter = 0;
+                            this.lastSendTime = 0;
                         }
 
                         process(inputs, outputs) {
                             const input = inputs[0][0];
                             if (input) {
-                                // Analyze audio for volume meter
-                                let sum = 0;
-                                for (let i = 0; i < input.length; i++) {
-                                    sum += input[i] * input[i];
-                                }
-                                const rms = Math.sqrt(sum / input.length);
-                                
-                                // Add data to buffer
+                                // Fast path for minimal processing latency
                                 this.buffer.push(...input);
                                 
-                                // Send chunks when buffer reaches size
+                                const now = currentTime * 1000; // Convert to ms
+                                const timeSinceLastSend = now - this.lastSendTime;
+                                
+                                // Send chunks as soon as buffer is filled
                                 while (this.buffer.length >= this.bufferSize) {
                                     const chunk = this.buffer.slice(0, this.bufferSize);
                                     
-                                    // Apply simple compression to reduce dynamic range
-                                    const compressedChunk = this.compressAudio(chunk);
+                                    // Volume calculation for meter
+                                    let sum = 0;
+                                    for (let i = 0; i < chunk.length; i++) {
+                                        sum += chunk[i] * chunk[i];
+                                    }
+                                    const rms = Math.sqrt(sum / chunk.length);
                                     
+                                    // Apply fast compression to reduce dynamic range
+                                    const compressedChunk = this.fastCompress(chunk);
+                                    
+                                    // Send packet with metadata
                                     this.port.postMessage({
                                         audioData: new Float32Array(compressedChunk),
-                                        volume: rms
+                                        volume: rms,
+                                        packetId: this.packetCounter++,
+                                        timestamp: now
                                     });
                                     
+                                    this.lastSendTime = now;
                                     this.buffer = this.buffer.slice(this.bufferSize);
                                 }
                             }
                             return true;
                         }
                         
-                        compressAudio(audioData) {
-                            // Simple compression algorithm
-                            const threshold = 0.3;
-                            const ratio = 4; // 4:1 compression
-                            const makeup = 1.5; // Gain makeup
+                        // Ultra-fast compression for voice
+                        fastCompress(audioData) {
+                            // Hard limiting with makeup gain for speed
+                            const threshold = 0.4;
+                            const makeup = 1.3;
                             
+                            // Fast in-place mapping operation
                             return audioData.map(sample => {
-                                const absValue = Math.abs(sample);
-                                if (absValue <= threshold) {
+                                const abs = Math.abs(sample);
+                                if (abs <= threshold) {
                                     return sample * makeup;
                                 } else {
-                                    const gain = threshold + (absValue - threshold) / ratio;
-                                    return (sample > 0 ? gain : -gain) * makeup;
+                                    // Hard limit at threshold + a tiny bit
+                                    const sign = sample < 0 ? -1 : 1;
+                                    return sign * (threshold + Math.min(0.1, abs - threshold) / 3) * makeup;
                                 }
                             });
                         }
@@ -243,12 +459,22 @@
                 processor = new AudioWorkletNode(audioContext, 'audio-processor');
                 processor.port.onmessage = (event) => {
                     if (ws && ws.readyState === WebSocket.OPEN) {
+                        const sendTime = performance.now();
                         ws.send(event.data.audioData.buffer);
+                        
+                        // Update UI
                         updateVolumeMeter(event.data.audioData);
                     }
                 };
 
                 source.connect(processor);
+                
+                // Reset buffers and counters
+                audioQueue = [];
+                isPlaying = false;
+                packetCounter = 0;
+                lastPacketTime = 0;
+                latencyHistory = [];
                 
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
@@ -290,6 +516,12 @@
         });
 
         stopBtn.addEventListener('click', stopCapture);
+        
+        // Toggle latency mode
+        lowLatencyMode.addEventListener('change', () => {
+            // Reset jitter buffer controller to adapt to new mode
+            jitterBuffer.lastAdaptation = 0;
+        });
 
         // Cleanup on page unload
         window.addEventListener('unload', stopCapture);

@@ -1,3 +1,4 @@
+import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -7,6 +8,9 @@ import asyncio
 from typing import Dict, Set
 import time
 import heapq
+
+# Import the translation function
+from translate import process_audio_for_translation
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +76,30 @@ class ServerStats:
 
 server_stats = ServerStats()
 
+# Function to process audio
+def process_audio(data: bytes) -> bytes:
+    """
+    Process audio data by amplifying the volume.
+    Input: Raw bytes from WebSocket (Float32Array).
+    Output: Processed bytes (amplified Float32Array).
+    """
+    try:
+        # Convert bytes to numpy array (Float32)
+        audio_array = np.frombuffer(data, dtype=np.float32)
+        
+        # Amplify volume by multiplying with gain factor (1.5 = 50% louder)
+        gain = 1.5
+        amplified_audio = audio_array * gain
+        
+        # Clip values to [-1.0, 1.0] to prevent distortion
+        amplified_audio = np.clip(amplified_audio, -1.0, 1.0)
+        
+        # Convert back to bytes
+        return amplified_audio.tobytes()
+    except Exception as e:
+        logger.error(f"Error processing audio: {e}")
+        return data  # Return original data if processing fails
+
 @app.get("/", response_class=HTMLResponse)
 async def get():
     try:
@@ -127,11 +155,17 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_bytes()
             client.last_activity = time.time()
             
+            # Process the audio data (e.g., amplify volume)
+            processed_data = process_audio(data)
+            
+            # Send to translation module - THIS IS THE CORE PART THE USER ASKED FOR
+            translated_data = process_audio_for_translation(processed_data)
+            
             # Add packet counter and timestamp for latency measurement
             client.packet_counter += 1
             
             # Update server statistics
-            server_stats.add_message(len(data))
+            server_stats.add_message(len(translated_data))
             
             # Log throughput and latency occasionally
             if server_stats.total_messages % 500 == 0:
@@ -155,7 +189,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Try to add the new packet
                     try:
                         # Use put_nowait to avoid blocking
-                        other_client.data_queue.put_nowait(data)
+                        other_client.data_queue.put_nowait(translated_data)
                     except asyncio.QueueFull:
                         # If still full after clearing, just skip this packet
                         pass
@@ -181,4 +215,4 @@ if __name__ == "__main__":
     logger.info(f"Starting server. Access it at:")
     logger.info(f" - On this computer: http://localhost:8000")
     logger.info(f" - On other devices (e.g., mobile): http://{local_ip}:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000, loop="uvloop")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
